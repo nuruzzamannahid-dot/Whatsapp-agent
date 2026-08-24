@@ -4,7 +4,8 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, RemoteAuth } = require('whatsapp-web.js');
+const TursoStore = require('./turso-store');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'changeme';
@@ -30,8 +31,17 @@ function normalizeName(name) {
 }
 
 // ---------- whatsapp client ----------
+const tursoStore = new TursoStore({
+  url: process.env.TURSO_DB_URL,
+  token: process.env.TURSO_DB_TOKEN
+});
+
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
+  authStrategy: new RemoteAuth({
+    store: tursoStore,
+    backupSyncIntervalMs: 300000, // save to Turso every 5 minutes
+    clientId: 'carrybee-bridge'
+  }),
   puppeteer: {
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
