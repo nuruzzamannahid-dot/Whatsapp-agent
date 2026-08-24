@@ -15,6 +15,7 @@ const MAPPING_FILE = path.join(__dirname, 'groups-config.json');
 let latestQr = null;
 let isReady = false;
 let clientInfo = null;
+let authPageReady = false; // true once the browser page has loaded and is waiting for either QR or a pairing code
 
 function loadMapping() {
   try {
@@ -51,7 +52,8 @@ const client = new Client({
 client.on('qr', async (qr) => {
   latestQr = await qrcode.toDataURL(qr);
   isReady = false;
-  console.log('New QR code generated. Visit /qr to scan it.');
+  authPageReady = true;
+  console.log('New QR code generated. Visit /qr to scan it, or /pair?phone=YOURNUMBER for a pairing code instead.');
 });
 
 client.on('ready', () => {
@@ -129,8 +131,66 @@ app.get('/qr', (req, res) => {
       <h1>Scan with WhatsApp on your phone</h1>
       <p>WhatsApp → Linked devices → Link a device</p>
       <img src="${latestQr}" style="width:280px;height:280px;border:8px solid #FFC72C;border-radius:12px;" />
+      <p style="margin-top:24px;"><a href="/pair">Prefer a code instead of scanning?</a></p>
     </body></html>
   `);
+});
+
+// Pairing code page — type this into WhatsApp instead of scanning a QR code
+// Visit /pair first (no phone yet) to see the form, or /pair?phone=8801XXXXXXXXX directly
+app.get('/pair', async (req, res) => {
+  if (isReady) {
+    return res.send('<p style="font-family:sans-serif">Already connected. <a href="/">Back to status</a></p>');
+  }
+
+  const rawPhone = (req.query.phone || '').replace(/[^\d]/g, '');
+
+  const pageWrap = (body) => `
+    <!DOCTYPE html>
+    <html><head><meta charset="UTF-8"><title>Link with phone number</title>
+    <style>
+      body{font-family:sans-serif;text-align:center;margin-top:60px;background:#FFFDF7;color:#141414;}
+      input{font-size:18px;padding:10px;border-radius:8px;border:1px solid #ccc;width:260px;}
+      button{font-size:16px;padding:10px 20px;border-radius:8px;border:none;background:#FFC72C;font-weight:700;cursor:pointer;margin-left:8px;}
+      code{font-size:36px;letter-spacing:6px;background:#faf8f0;padding:16px 24px;border-radius:12px;border:8px solid #FFC72C;display:inline-block;margin-top:20px;}
+    </style></head>
+    <body>${body}</body></html>
+  `;
+
+  if (!rawPhone) {
+    return res.send(pageWrap(`
+      <h1>Link with phone number</h1>
+      <p>Enter the CarryBee WhatsApp number, with country code, no spaces, no + sign.<br>Example for Bangladesh: 8801XXXXXXXXX</p>
+      <form action="/pair" method="GET">
+        <input type="text" name="phone" placeholder="8801XXXXXXXXX" required />
+        <button type="submit">Get code</button>
+      </form>
+      <p style="margin-top:24px;"><a href="/qr">Prefer to scan a QR code instead?</a></p>
+    `));
+  }
+
+  if (!authPageReady) {
+    return res.send(pageWrap(`
+      <h1>Not ready yet</h1>
+      <p>The bridge is still starting up. Wait about 10-15 seconds and reload this page.</p>
+    `));
+  }
+
+  try {
+    const code = await client.requestPairingCode(rawPhone);
+    res.send(pageWrap(`
+      <h1>Enter this code in WhatsApp</h1>
+      <p>On the CarryBee phone: WhatsApp → Settings → Linked devices → Link a device → "Link with phone number instead"</p>
+      <code>${code}</code>
+      <p style="margin-top:24px;color:#7a7566;font-size:13px;">Code expires after a short time — if it stops working, reload this page for a new one.</p>
+    `));
+  } catch (e) {
+    res.send(pageWrap(`
+      <h1>Something went wrong</h1>
+      <p>${e.message}</p>
+      <p><a href="/pair">Try again</a></p>
+    `));
+  }
 });
 
 // Connection status (JSON)
