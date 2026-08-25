@@ -269,7 +269,151 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// One-click admin page — no commands, no headers to type by hand.
+// The API key you enter here stays only in your browser and is sent
+// automatically with each button click.
+app.get('/admin', (req, res) => {
+  res.send(`
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="UTF-8">
+    <title>CarryBee Bridge Admin</title>
+    <style>
+      body{font-family:'Plus Jakarta Sans',Arial,sans-serif;background:#FFFDF7;color:#1c1c1c;max-width:760px;margin:40px auto;padding:0 20px;}
+      h1{font-family:'Space Grotesk',sans-serif;font-size:22px;}
+      h2{font-size:15px;margin-top:36px;border-top:1px solid #eee;padding-top:24px;}
+      label{display:block;font-size:12px;font-weight:600;color:#555;margin-bottom:4px;margin-top:12px;}
+      input{width:100%;box-sizing:border-box;font-size:14px;padding:9px 10px;border-radius:8px;border:1px solid #ccc;}
+      button{font-size:13px;padding:9px 16px;border-radius:8px;border:none;background:#FFC72C;font-weight:700;cursor:pointer;margin-top:12px;}
+      button.secondary{background:#eee;}
+      table{width:100%;border-collapse:collapse;margin-top:14px;font-size:13px;}
+      td,th{text-align:left;padding:6px 8px;border-bottom:1px solid #eee;}
+      .msg{font-size:13px;padding:8px 10px;border-radius:6px;margin-top:10px;}
+      .msg.ok{background:#e9f6ee;color:#2E8B57;}
+      .msg.err{background:#fdeceb;color:#D64545;}
+      .row{display:flex;gap:8px;align-items:end;}
+      .row > div{flex:1;}
+      code{background:#faf8f0;padding:1px 5px;border-radius:4px;font-size:12px;}
+    </style>
+  </head>
+  <body>
+    <h1>🐝 CarryBee Bridge Admin</h1>
 
+    <label>Bridge API Key</label>
+    <input type="password" id="apiKey" placeholder="paste your API_KEY here" />
+    <p style="font-size:11px;color:#888;">This stays only in your browser tab — it's sent with each button click below, nothing is saved anywhere.</p>
+
+    <h2>1. Your WhatsApp groups</h2>
+    <button onclick="loadGroups()">Load my WhatsApp groups</button>
+    <div id="groupsMsg"></div>
+    <table id="groupsTable" style="display:none;">
+      <thead><tr><th>Group name</th><th>Group ID</th></tr></thead>
+      <tbody id="groupsBody"></tbody>
+    </table>
+
+    <h2>2. Map a dashboard group name → WhatsApp group</h2>
+    <div class="row">
+      <div>
+        <label>Dashboard group name (exact text, e.g. "CarryBee Issue Group || NN1")</label>
+        <input type="text" id="mapName" placeholder="CarryBee Issue Group || NN1" />
+      </div>
+    </div>
+    <label>WhatsApp group</label>
+    <select id="mapGroupSelect" style="width:100%;padding:9px 10px;border-radius:8px;border:1px solid #ccc;font-size:14px;">
+      <option value="">Load groups above first</option>
+    </select>
+    <button onclick="saveMapping()">Save mapping</button>
+    <div id="mapMsg"></div>
+
+    <h2>3. Current mappings</h2>
+    <button class="secondary" onclick="loadMappings()">Refresh current mappings</button>
+    <div id="mappingsMsg"></div>
+    <table id="mappingsTable" style="display:none;">
+      <thead><tr><th>Dashboard group name</th><th>WhatsApp group ID</th><th></th></tr></thead>
+      <tbody id="mappingsBody"></tbody>
+    </table>
+
+    <script>
+      function key() { return document.getElementById('apiKey').value.trim(); }
+      function showMsg(elId, text, ok) {
+        document.getElementById(elId).innerHTML = '<div class="msg ' + (ok ? 'ok' : 'err') + '">' + text + '</div>';
+      }
+      async function api(path, opts = {}) {
+        const res = await fetch(path, {
+          ...opts,
+          headers: { 'Content-Type': 'application/json', 'x-api-key': key(), ...(opts.headers || {}) }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('Request failed: ' + res.status));
+        return data;
+      }
+
+      let lastGroups = [];
+
+      async function loadGroups() {
+        if (!key()) { showMsg('groupsMsg', 'Enter your API key first.', false); return; }
+        showMsg('groupsMsg', 'Loading...', true);
+        try {
+          const data = await api('/api/groups');
+          lastGroups = data.groups || [];
+          const body = document.getElementById('groupsBody');
+          body.innerHTML = lastGroups.map(g => '<tr><td>' + g.name + '</td><td><code>' + g.id + '</code></td></tr>').join('');
+          document.getElementById('groupsTable').style.display = lastGroups.length ? 'table' : 'none';
+          const select = document.getElementById('mapGroupSelect');
+          select.innerHTML = lastGroups.map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
+          showMsg('groupsMsg', 'Loaded ' + lastGroups.length + ' groups.', true);
+        } catch (e) {
+          showMsg('groupsMsg', e.message, false);
+        }
+      }
+
+      async function saveMapping() {
+        if (!key()) { showMsg('mapMsg', 'Enter your API key first.', false); return; }
+        const dashboard_name = document.getElementById('mapName').value.trim();
+        const group_id = document.getElementById('mapGroupSelect').value;
+        if (!dashboard_name || !group_id) { showMsg('mapMsg', 'Fill in both the dashboard name and pick a WhatsApp group.', false); return; }
+        try {
+          await api('/api/mapping', { method: 'POST', body: JSON.stringify({ dashboard_name, group_id }) });
+          showMsg('mapMsg', 'Saved: "' + dashboard_name + '" → that WhatsApp group.', true);
+          document.getElementById('mapName').value = '';
+          loadMappings();
+        } catch (e) {
+          showMsg('mapMsg', e.message, false);
+        }
+      }
+
+      async function loadMappings() {
+        if (!key()) { showMsg('mappingsMsg', 'Enter your API key first.', false); return; }
+        try {
+          const data = await api('/api/mapping');
+          const entries = Object.entries(data);
+          const body = document.getElementById('mappingsBody');
+          body.innerHTML = entries.map(([k, v]) =>
+            '<tr><td>' + v.label + '</td><td><code>' + v.group_id + '</code></td>' +
+            '<td><button class="secondary" onclick="removeMapping(\\'' + v.label.replace(/'/g, "\\\\'") + '\\')">Remove</button></td></tr>'
+          ).join('');
+          document.getElementById('mappingsTable').style.display = entries.length ? 'table' : 'none';
+          showMsg('mappingsMsg', entries.length + ' mapping(s) saved.', true);
+        } catch (e) {
+          showMsg('mappingsMsg', e.message, false);
+        }
+      }
+
+      async function removeMapping(name) {
+        if (!key()) return;
+        try {
+          await api('/api/mapping/' + encodeURIComponent(name), { method: 'DELETE' });
+          loadMappings();
+        } catch (e) {
+          showMsg('mappingsMsg', e.message, false);
+        }
+      }
+    </script>
+  </body>
+  </html>
+  `);
+});
 app.listen(PORT, () => {
   console.log(`CarryBee WhatsApp Bridge running on port ${PORT}`);
 });
