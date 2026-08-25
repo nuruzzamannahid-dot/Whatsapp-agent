@@ -10,37 +10,51 @@ async function useTursoAuthState(store) {
       keys: {
         get: async (type, ids) => {
           const data = {};
-          await Promise.all(ids.map(async (id) => {
-            let value = await store.get(`${type}-${id}`);
-            if (value) {
-              value = JSON.parse(value, BufferJSON.reviver);
-              if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+          try {
+            await Promise.all(ids.map(async (id) => {
+              let value = await store.get(`${type}-${id}`);
+              if (value) {
+                value = JSON.parse(value, BufferJSON.reviver);
+                if (type === 'app-state-sync-key' && value) {
+                  value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                }
               }
-            }
-            data[id] = value;
-          }));
+              data[id] = value;
+            }));
+          } catch (e) {
+            console.error('[baileys-auth] keys.get failed, continuing:', e.message);
+          }
           return data;
         },
         set: async (data) => {
-          const tasks = [];
+          const toSave = [];
+          const toDelete = [];
           for (const category in data) {
             for (const id in data[category]) {
               const value = data[category][id];
               const key = `${category}-${id}`;
-              tasks.push(
-                value
-                  ? store.set(key, JSON.stringify(value, BufferJSON.replacer))
-                  : store.delete(key)
-              );
+              if (value) {
+                toSave.push({ key, value: JSON.stringify(value, BufferJSON.replacer) });
+              } else {
+                toDelete.push(key);
+              }
             }
           }
-          await Promise.all(tasks);
+          try {
+            if (toSave.length) await store.setMany(toSave);
+            if (toDelete.length) await store.deleteMany(toDelete);
+          } catch (e) {
+            console.error('[baileys-auth] keys.set failed, continuing:', e.message);
+          }
         }
       }
     },
     saveCreds: async () => {
-      await store.set('creds', JSON.stringify(creds, BufferJSON.replacer));
+      try {
+        await store.set('creds', JSON.stringify(creds, BufferJSON.replacer));
+      } catch (e) {
+        console.error('[baileys-auth] saveCreds failed, continuing:', e.message);
+      }
     }
   };
 }
