@@ -4,18 +4,20 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode');
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const TursoStore = require('./turso-store');
+const pino = require('pino');
+const { Boom } = require('@hapi/boom');
+const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const TursoKVStore = require('./turso-store');
+const useTursoAuthState = require('./baileys-auth');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'changeme';
 const MAPPING_FILE = path.join(__dirname, 'groups-config.json');
 
-// ---------- state ----------
 let latestQr = null;
 let isReady = false;
-let clientInfo = null;
-let authPageReady = false; // true once the browser page has loaded and is waiting for either QR or a pairing code
+let userInfo = null;
+let sock = null;
 
 function loadMapping() {
   try {
@@ -31,56 +33,52 @@ function normalizeName(name) {
   return (name || '').trim().toLowerCase();
 }
 
-// ---------- whatsapp client ----------
-const tursoStore = new TursoStore({
+const kvStore = new TursoKVStore({
   url: process.env.TURSO_DB_URL,
   token: process.env.TURSO_DB_TOKEN
 });
 
-const client = new Client({
-  authStrategy: new RemoteAuth({
-    store: tursoStore,
-    backupSyncIntervalMs: 300000, // save to Turso every 5 minutes
-    clientId: 'carrybee-bridge'
-  }),
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-extensions'
-    ]
-  }
-});
+async function startSock() {
+  const { state, saveCreds } = await useTursoAuthState(kvStore);
 
-client.on('qr', async (qr) => {
-  latestQr = await qrcode.toDataURL(qr);
-  isReady = false;
-  authPageReady = true;
-  console.log('New QR code generated. Visit /qr to scan it, or /pair?phone=YOURNUMBER for a pairing code instead.');
-});
+  sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false
+  });
 
-client.on('ready', () => {
-  isReady = true;
-  latestQr = null;
-  clientInfo = client.info;
-  console.log('WhatsApp client ready as', clientInfo && clientInfo.pushname);
-});
+  sock.ev.on('creds.update', saveCreds);
 
-client.on('disconnected', (reason) => {
-  isReady = false;
-  console.log('WhatsApp client disconnected:', reason);
-});
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.initialize();
+    if (qr) {
+      qrcode.toDataURL(qr).then(dataUrl => { latestQr = dataUrl; });
+      isReady = false;
+      console.log('New QR code generated. Visit /qr to scan it, or /pair?phone=YOURNUMBER for a pairing code instead.');
+    }
 
-// ---------- express app ----------
+    if (connection === 'open') {
+      isReady = true;
+      latestQr = null;
+      userInfo = sock.user;
+      console.log('WhatsApp connected as', userInfo && (userInfo.name || userInfo.id));
+    }
+
+    if (connection === 'close') {
+      isReady = false;
+      const statusCode = new Boom(lastDisconnect && lastDisconnect.error)?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      console.log('Connection closed. Status code:', statusCode, loggedOut ? '(logged out — need new QR/code)' : '(reconnecting...)');
+      if (!loggedOut) {
+        startSock();
+      }
+    }
+  });
+}
+
+startSock();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -93,7 +91,6 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// Status/admin page
 app.get('/', (req, res) => {
   res.send(`
   <!DOCTYPE html>
@@ -115,7 +112,7 @@ app.get('/', (req, res) => {
   <body>
     <h1>🐝 CarryBee WhatsApp Bridge</h1>
     <p>Status: <span class="badge ${isReady ? 'on' : 'off'}">${isReady ? 'Connected' : 'Not connected'}</span></p>
-    ${isReady ? `<p>Logged in as: <strong>${clientInfo ? clientInfo.pushname : ''}</strong></p>` : `<p>Scan the QR code to connect: <a href="/qr">/qr</a></p>`}
+    ${isReady ? `<p>Logged in as: <strong>${userInfo ? (userInfo.name || userInfo.id) : ''}</strong></p>` : `<p>Connect via <a href="/qr">/qr</a> (scan) or <a href="/pair">/pair</a> (type a code)</p>`}
     <p>List your WhatsApp groups (and their IDs) at: <a href="/api/groups">/api/groups</a> (requires <code>x-api-key</code> header)</p>
     <p>Current dashboard → WhatsApp group mapping is in <code>groups-config.json</code>, or manage it via <code>POST /api/mapping</code>.</p>
     <footer>Powered by NAHID</footer>
@@ -124,7 +121,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-// QR code page
 app.get('/qr', (req, res) => {
   if (isReady) {
     return res.send('<p style="font-family:sans-serif">Already connected. <a href="/">Back to status</a></p>');
@@ -146,8 +142,6 @@ app.get('/qr', (req, res) => {
   `);
 });
 
-// Pairing code page — type this into WhatsApp instead of scanning a QR code
-// Visit /pair first (no phone yet) to see the form, or /pair?phone=8801XXXXXXXXX directly
 app.get('/pair', async (req, res) => {
   if (isReady) {
     return res.send('<p style="font-family:sans-serif">Already connected. <a href="/">Back to status</a></p>');
@@ -179,15 +173,15 @@ app.get('/pair', async (req, res) => {
     `));
   }
 
-  if (!authPageReady) {
+  if (!sock || !sock.authState || sock.authState.creds.registered) {
     return res.send(pageWrap(`
       <h1>Not ready yet</h1>
-      <p>The bridge is still starting up. Wait about 10-15 seconds and reload this page.</p>
+      <p>The bridge is still starting up, or is already registered. Wait a few seconds and reload, or check <a href="/">the status page</a>.</p>
     `));
   }
 
   try {
-    const code = await client.requestPairingCode(rawPhone);
+    const code = await sock.requestPairingCode(rawPhone);
     res.send(pageWrap(`
       <h1>Enter this code in WhatsApp</h1>
       <p>On the CarryBee phone: WhatsApp → Settings → Linked devices → Link a device → "Link with phone number instead"</p>
@@ -203,31 +197,25 @@ app.get('/pair', async (req, res) => {
   }
 });
 
-// Connection status (JSON)
 app.get('/api/status', (req, res) => {
-  res.json({ ready: isReady, pushname: clientInfo ? clientInfo.pushname : null });
+  res.json({ ready: isReady, name: userInfo ? (userInfo.name || userInfo.id) : null });
 });
 
-// List all WhatsApp groups this account is a member of
 app.get('/api/groups', requireApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'WhatsApp client not connected yet' });
   try {
-    const chats = await client.getChats();
-    const groups = chats
-      .filter(c => c.isGroup)
-      .map(c => ({ id: c.id._serialized, name: c.name }));
+    const groupsObj = await sock.groupFetchAllParticipating();
+    const groups = Object.values(groupsObj).map(g => ({ id: g.id, name: g.subject }));
     res.json({ groups });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// View current mapping
 app.get('/api/mapping', requireApiKey, (req, res) => {
   res.json(loadMapping());
 });
 
-// Add or update a mapping entry: { "dashboard_name": "...", "group_id": "...@g.us" }
 app.post('/api/mapping', requireApiKey, (req, res) => {
   const { dashboard_name, group_id } = req.body;
   if (!dashboard_name || !group_id) {
@@ -239,7 +227,6 @@ app.post('/api/mapping', requireApiKey, (req, res) => {
   res.json({ ok: true, mapping });
 });
 
-// Remove a mapping entry
 app.delete('/api/mapping/:dashboard_name', requireApiKey, (req, res) => {
   const mapping = loadMapping();
   const key = normalizeName(req.params.dashboard_name);
@@ -248,8 +235,6 @@ app.delete('/api/mapping/:dashboard_name', requireApiKey, (req, res) => {
   res.json({ ok: true, mapping });
 });
 
-// Main endpoint: dashboard calls this when a KAM saves a remark
-// body: { group_name: "CarryBee Issue Group || NN1", message: "...", ticket_id: "CB-0816-00856", kam_name: "Nuruzzaman Nahid" }
 app.post('/api/send-remark', requireApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'WhatsApp client not connected yet' });
 
@@ -271,7 +256,7 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
   if (kam_name) formatted = `${formatted}\n— ${kam_name}`;
 
   try {
-    await client.sendMessage(entry.group_id, formatted);
+    await sock.sendMessage(entry.group_id, { text: formatted });
     res.json({ ok: true, sent_to: entry.label });
   } catch (e) {
     res.status(500).json({ error: e.message });
