@@ -5,22 +5,30 @@ class TursoKVStore {
     this.ready = false;
   }
 
+  async _run(requests) {
+    const res = await fetch(this.url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests: [...requests, { type: 'close' }] })
+    });
+    if (!res.ok) throw new Error(`Turso HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.results) throw new Error('Turso: no results in response');
+    data.results.forEach((r, i) => {
+      if (r && r.type === 'error') {
+        throw new Error(`Turso statement ${i} failed: ${(r.error && r.error.message) || 'unknown error'}`);
+      }
+    });
+    return data.results;
+  }
+
   async _query(sql, args = []) {
     const stmt = { sql };
     if (args.length) {
       stmt.args = args.map(a => ({ type: 'text', value: String(a) }));
     }
-    const res = await fetch(this.url, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requests: [{ type: 'execute', stmt }, { type: 'close' }] })
-    });
-    if (!res.ok) throw new Error(`Turso HTTP ${res.status}`);
-    const data = await res.json();
-    const execResult = data.results && data.results[0];
-    if (!execResult || execResult.type === 'error') {
-      throw new Error((execResult && execResult.error && execResult.error.message) || 'Turso query failed');
-    }
+    const results = await this._run([{ type: 'execute', stmt }]);
+    const execResult = results[0];
     const result = execResult.response.result;
     const cols = (result.cols || []).map(c => c.name);
     return (result.rows || []).map(row => {
@@ -47,16 +55,42 @@ class TursoKVStore {
   }
 
   async set(key, value) {
+    await this.setMany([{ key, value }]);
+  }
+
+  async setMany(entries) {
+    if (!entries.length) return;
     await this._ensureTable();
-    await this._query(
-      'INSERT OR REPLACE INTO baileys_auth (key_name, value_text, updated_at) VALUES (?, ?, ?)',
-      [key, value, new Date().toISOString()]
-    );
+    const now = new Date().toISOString();
+    const requests = entries.map(({ key, value }) => ({
+      type: 'execute',
+      stmt: {
+        sql: 'INSERT OR REPLACE INTO baileys_auth (key_name, value_text, updated_at) VALUES (?, ?, ?)',
+        args: [
+          { type: 'text', value: String(key) },
+          { type: 'text', value: String(value) },
+          { type: 'text', value: now }
+        ]
+      }
+    }));
+    await this._run(requests);
   }
 
   async delete(key) {
+    await this.deleteMany([key]);
+  }
+
+  async deleteMany(keys) {
+    if (!keys.length) return;
     await this._ensureTable();
-    await this._query('DELETE FROM baileys_auth WHERE key_name = ?', [key]);
+    const requests = keys.map(key => ({
+      type: 'execute',
+      stmt: {
+        sql: 'DELETE FROM baileys_auth WHERE key_name = ?',
+        args: [{ type: 'text', value: String(key) }]
+      }
+    }));
+    await this._run(requests);
   }
 }
 
