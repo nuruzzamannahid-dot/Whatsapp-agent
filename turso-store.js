@@ -1,6 +1,4 @@
-const fs = require('fs');
-
-class TursoStore {
+class TursoKVStore {
   constructor({ url, token }) {
     this.url = url;
     this.token = token;
@@ -34,43 +32,32 @@ class TursoStore {
 
   async _ensureTable() {
     if (this.ready) return;
-    await this._query(`CREATE TABLE IF NOT EXISTS whatsapp_sessions (
-      session_name TEXT PRIMARY KEY,
-      data_base64 TEXT NOT NULL,
+    await this._query(`CREATE TABLE IF NOT EXISTS baileys_auth (
+      key_name TEXT PRIMARY KEY,
+      value_text TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`);
     this.ready = true;
   }
 
-  async sessionExists({ session }) {
+  async get(key) {
     await this._ensureTable();
-    const rows = await this._query('SELECT 1 FROM whatsapp_sessions WHERE session_name = ?', [session]);
-    return rows.length > 0;
+    const rows = await this._query('SELECT value_text FROM baileys_auth WHERE key_name = ?', [key]);
+    return rows.length ? rows[0].value_text : null;
   }
 
-  async save({ session }) {
+  async set(key, value) {
     await this._ensureTable();
-    const buffer = fs.readFileSync(`${session}.zip`);
-    const base64 = buffer.toString('base64');
     await this._query(
-      'INSERT OR REPLACE INTO whatsapp_sessions (session_name, data_base64, updated_at) VALUES (?, ?, ?)',
-      [session, base64, new Date().toISOString()]
+      'INSERT OR REPLACE INTO baileys_auth (key_name, value_text, updated_at) VALUES (?, ?, ?)',
+      [key, value, new Date().toISOString()]
     );
-    console.log(`[TursoStore] Saved session "${session}" (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
   }
 
-  async extract({ session, path }) {
+  async delete(key) {
     await this._ensureTable();
-    const rows = await this._query('SELECT data_base64 FROM whatsapp_sessions WHERE session_name = ?', [session]);
-    if (!rows.length) throw new Error(`No stored session found for "${session}"`);
-    fs.writeFileSync(path, Buffer.from(rows[0].data_base64, 'base64'));
-    console.log(`[TursoStore] Restored session "${session}" from database`);
-  }
-
-  async delete({ session }) {
-    await this._ensureTable();
-    await this._query('DELETE FROM whatsapp_sessions WHERE session_name = ?', [session]);
+    await this._query('DELETE FROM baileys_auth WHERE key_name = ?', [key]);
   }
 }
 
-module.exports = TursoStore;
+module.exports = TursoKVStore;
