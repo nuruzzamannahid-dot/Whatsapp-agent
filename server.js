@@ -1,11 +1,16 @@
 require('dotenv').config();
 
+// Safety net: log unexpected errors instead of letting one bad promise
+// crash the entire bridge and force a re-pair. The real fixes are the
+// batched Turso writes in turso-store.js/baileys-auth.js — this is just
+// a backstop in case something else slips through.
 process.on('unhandledRejection', (err) => {
   console.error('[UNHANDLED REJECTION]', err);
 });
 process.on('uncaughtException', (err) => {
   console.error('[UNCAUGHT EXCEPTION]', err);
 });
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -21,6 +26,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'changeme';
 const MAPPING_FILE = path.join(__dirname, 'groups-config.json');
 
+// ---------- state ----------
 let latestQr = null;
 let isReady = false;
 let userInfo = null;
@@ -40,6 +46,7 @@ function normalizeName(name) {
   return (name || '').trim().toLowerCase();
 }
 
+// ---------- whatsapp connection (Baileys — no Chrome needed) ----------
 const kvStore = new TursoKVStore({
   url: process.env.TURSO_DB_URL,
   token: process.env.TURSO_DB_TOKEN
@@ -86,6 +93,7 @@ async function startSock() {
 
 startSock();
 
+// ---------- express app ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -98,6 +106,7 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// Status/admin page
 app.get('/', (req, res) => {
   res.send(`
   <!DOCTYPE html>
@@ -128,6 +137,7 @@ app.get('/', (req, res) => {
   `);
 });
 
+// QR code page
 app.get('/qr', (req, res) => {
   if (isReady) {
     return res.send('<p style="font-family:sans-serif">Already connected. <a href="/">Back to status</a></p>');
@@ -149,6 +159,7 @@ app.get('/qr', (req, res) => {
   `);
 });
 
+// Pairing code page — type this into WhatsApp instead of scanning a QR code
 app.get('/pair', async (req, res) => {
   if (isReady) {
     return res.send('<p style="font-family:sans-serif">Already connected. <a href="/">Back to status</a></p>');
@@ -204,10 +215,12 @@ app.get('/pair', async (req, res) => {
   }
 });
 
+// Connection status (JSON)
 app.get('/api/status', (req, res) => {
   res.json({ ready: isReady, name: userInfo ? (userInfo.name || userInfo.id) : null });
 });
 
+// List all WhatsApp groups this account is a member of
 app.get('/api/groups', requireApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'WhatsApp client not connected yet' });
   try {
@@ -219,10 +232,12 @@ app.get('/api/groups', requireApiKey, async (req, res) => {
   }
 });
 
+// View current mapping
 app.get('/api/mapping', requireApiKey, (req, res) => {
   res.json(loadMapping());
 });
 
+// Add or update a mapping entry: { "dashboard_name": "...", "group_id": "...@g.us" }
 app.post('/api/mapping', requireApiKey, (req, res) => {
   const { dashboard_name, group_id } = req.body;
   if (!dashboard_name || !group_id) {
@@ -234,6 +249,7 @@ app.post('/api/mapping', requireApiKey, (req, res) => {
   res.json({ ok: true, mapping });
 });
 
+// Remove a mapping entry
 app.delete('/api/mapping/:dashboard_name', requireApiKey, (req, res) => {
   const mapping = loadMapping();
   const key = normalizeName(req.params.dashboard_name);
@@ -242,10 +258,12 @@ app.delete('/api/mapping/:dashboard_name', requireApiKey, (req, res) => {
   res.json({ ok: true, mapping });
 });
 
+// Main endpoint: dashboard calls this when a KAM saves a remark
+// body: { group_name: "CarryBee Issue Group || NN1", message: "...(fully formatted by the dashboard)..." }
 app.post('/api/send-remark', requireApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ error: 'WhatsApp client not connected yet' });
 
-  const { group_name, message, ticket_id, kam_name } = req.body;
+  const { group_name, message } = req.body;
   if (!group_name || !message) {
     return res.status(400).json({ error: 'group_name and message are required' });
   }
@@ -258,17 +276,14 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
     });
   }
 
-  let formatted = message;
-  if (ticket_id) formatted = `*${ticket_id}*\n${formatted}`;
-  if (kam_name) formatted = `${formatted}\n— ${kam_name}`;
-
   try {
-    await sock.sendMessage(entry.group_id, { text: formatted });
+    await sock.sendMessage(entry.group_id, { text: message });
     res.json({ ok: true, sent_to: entry.label });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
 // One-click admin page — no commands, no headers to type by hand.
 // The API key you enter here stays only in your browser and is sent
 // automatically with each button click.
@@ -414,6 +429,7 @@ app.get('/admin', (req, res) => {
   </html>
   `);
 });
+
 app.listen(PORT, () => {
   console.log(`CarryBee WhatsApp Bridge running on port ${PORT}`);
 });
