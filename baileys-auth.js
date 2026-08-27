@@ -1,8 +1,14 @@
 const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
 async function useTursoAuthState(store) {
-  const credsRaw = await store.get('creds');
-  let creds = credsRaw ? JSON.parse(credsRaw, BufferJSON.reviver) : initAuthCreds();
+  let creds;
+  try {
+    const credsRaw = await store.get('creds');
+    creds = credsRaw ? JSON.parse(credsRaw, BufferJSON.reviver) : initAuthCreds();
+  } catch (e) {
+    console.error('[baileys-auth] failed to load creds from Turso, starting fresh:', e.message);
+    creds = initAuthCreds();
+  }
 
   return {
     state: {
