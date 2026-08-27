@@ -92,6 +92,15 @@ class TursoKVStore {
     }));
     await this._run(requests);
   }
+
+  // Wipes the entire stored session. Used when WhatsApp reports the
+  // session as logged out (401) — the stored creds are dead, so we
+  // clear them and start clean rather than getting stuck retrying
+  // with credentials that will never be accepted again.
+  async clearAll() {
+    await this._ensureTable();
+    await this._query('DELETE FROM baileys_auth');
+  }
 }
 
 module.exports = TursoKVStore;
