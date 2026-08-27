@@ -83,8 +83,15 @@ async function startSock() {
       isReady = false;
       const statusCode = new Boom(lastDisconnect && lastDisconnect.error)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log('Connection closed. Status code:', statusCode, loggedOut ? '(logged out — need new QR/code)' : '(reconnecting...)');
-      if (!loggedOut) {
+      console.log('Connection closed. Status code:', statusCode, loggedOut ? '(logged out — clearing stale session and generating a new QR/code)' : '(reconnecting...)');
+      if (loggedOut) {
+        // The stored session is dead and will never be accepted again —
+        // wipe it so the next startSock() starts fresh and actually
+        // offers a new QR code instead of getting stuck here forever.
+        kvStore.clearAll()
+          .catch(e => console.error('[server] failed to clear stale session:', e.message))
+          .finally(() => startSock());
+      } else {
         startSock();
       }
     }
