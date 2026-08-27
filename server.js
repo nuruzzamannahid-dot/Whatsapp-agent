@@ -56,7 +56,11 @@ async function saveMapping(mapping) {
   try { fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2)); } catch (e) {}
 }
 function normalizeName(name) {
-  return (name || '').trim().toLowerCase();
+  return (name || '')
+    .replace(/[\u00A0\u200B-\u200D\uFEFF]/g, ' ') // NBSP/zero-width chars from copy-pasted sheet cells -> normal space
+    .trim()
+    .replace(/\s+/g, ' ') // collapse any run of whitespace to a single space
+    .toLowerCase();
 }
 
 // ---------- whatsapp connection (Baileys — no Chrome needed) ----------
