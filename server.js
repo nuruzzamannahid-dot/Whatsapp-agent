@@ -32,15 +32,28 @@ let isReady = false;
 let userInfo = null;
 let sock = null;
 
-function loadMapping() {
+// Group mapping used to live in a local groups-config.json file. On
+// Render's free tier, the filesystem is wiped every time the instance
+// spins down from inactivity and back up, so that mapping kept vanishing
+// silently. It's now stored in Turso (same as the WhatsApp session
+// creds) under a single key, so it actually persists.
+async function loadMapping() {
   try {
-    return JSON.parse(fs.readFileSync(MAPPING_FILE, 'utf8'));
+    const raw = await kvStore.get('group-mapping');
+    return raw ? JSON.parse(raw) : {};
   } catch (e) {
-    return {};
+    console.error('[server] failed to load group mapping from Turso, falling back to local file:', e.message);
+    try {
+      return JSON.parse(fs.readFileSync(MAPPING_FILE, 'utf8'));
+    } catch (e2) {
+      return {};
+    }
   }
 }
-function saveMapping(mapping) {
-  fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2));
+async function saveMapping(mapping) {
+  await kvStore.set('group-mapping', JSON.stringify(mapping));
+  // Best-effort local copy too, purely as a debugging convenience — not relied on.
+  try { fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2)); } catch (e) {}
 }
 function normalizeName(name) {
   return (name || '').trim().toLowerCase();
@@ -240,28 +253,28 @@ app.get('/api/groups', requireApiKey, async (req, res) => {
 });
 
 // View current mapping
-app.get('/api/mapping', requireApiKey, (req, res) => {
-  res.json(loadMapping());
+app.get('/api/mapping', requireApiKey, async (req, res) => {
+  res.json(await loadMapping());
 });
 
 // Add or update a mapping entry: { "dashboard_name": "...", "group_id": "...@g.us" }
-app.post('/api/mapping', requireApiKey, (req, res) => {
+app.post('/api/mapping', requireApiKey, async (req, res) => {
   const { dashboard_name, group_id } = req.body;
   if (!dashboard_name || !group_id) {
     return res.status(400).json({ error: 'dashboard_name and group_id are required' });
   }
-  const mapping = loadMapping();
+  const mapping = await loadMapping();
   mapping[normalizeName(dashboard_name)] = { label: dashboard_name, group_id };
-  saveMapping(mapping);
+  await saveMapping(mapping);
   res.json({ ok: true, mapping });
 });
 
 // Remove a mapping entry
-app.delete('/api/mapping/:dashboard_name', requireApiKey, (req, res) => {
-  const mapping = loadMapping();
+app.delete('/api/mapping/:dashboard_name', requireApiKey, async (req, res) => {
+  const mapping = await loadMapping();
   const key = normalizeName(req.params.dashboard_name);
   delete mapping[key];
-  saveMapping(mapping);
+  await saveMapping(mapping);
   res.json({ ok: true, mapping });
 });
 
@@ -275,7 +288,7 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
     return res.status(400).json({ error: 'group_name and message are required' });
   }
 
-  const mapping = loadMapping();
+  const mapping = await loadMapping();
   const entry = mapping[normalizeName(group_name)];
   if (!entry) {
     return res.status(404).json({
