@@ -124,6 +124,29 @@ const kvStore = new TursoKVStore({
   token: process.env.TURSO_DB_TOKEN
 });
 
+// ---------- outgoing message store (needed for Baileys retry requests) ----------
+// WhatsApp Multi-Device is built on the Signal protocol: it's normal and
+// frequent for a recipient's device to fail to decrypt a message on the
+// first delivery and silently ask the sender to resend it ("retry
+// receipt"). Baileys can only answer that request if we hand it back the
+// original message content via getMessage() in the socket config below —
+// without that, the retry just fails and the recipient is stuck showing
+// "Waiting for this message. This may take a while." forever, even though
+// the send itself succeeded. This was the actual cause of the undecrypted
+// OPS messages, not a stale session.
+// Bounded + in-memory is enough here: retries normally happen within
+// seconds to a couple of minutes of sending, never after a process restart.
+const OUTGOING_MSG_STORE_LIMIT = 500;
+const outgoingMessageStore = new Map(); // `${remoteJid}::${id}` -> proto.IMessage
+
+function rememberOutgoingMessage(remoteJid, id, message) {
+  if (!id || !message) return;
+  outgoingMessageStore.set(`${remoteJid}::${id}`, message);
+  if (outgoingMessageStore.size > OUTGOING_MSG_STORE_LIMIT) {
+    outgoingMessageStore.delete(outgoingMessageStore.keys().next().value);
+  }
+}
+
 async function startSock(accountId, label) {
   const prefix = keyPrefixFor(accountId);
   const { state, saveCreds } = await useTursoAuthState(kvStore, prefix);
@@ -136,7 +159,11 @@ async function startSock(accountId, label) {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    // See outgoingMessageStore above — lets Baileys resend the real content
+    // when a recipient device requests a retry, instead of the message
+    // getting permanently stuck undecrypted on their end.
+    getMessage: async (key) => outgoingMessageStore.get(`${key.remoteJid}::${key.id}`) || undefined
   });
   acc.sock = sock;
 
@@ -457,7 +484,10 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
   }
 
   try {
-    await acc.sock.sendMessage(entry.group_id, { text: message });
+    const sentMsg = await acc.sock.sendMessage(entry.group_id, { text: message });
+    if (sentMsg && sentMsg.key && sentMsg.message) {
+      rememberOutgoingMessage(entry.group_id, sentMsg.key.id, sentMsg.message);
+    }
     res.json({ ok: true, sent_to: entry.label, via_account: acc.label });
   } catch (e) {
     res.status(500).json({ error: e.message });
