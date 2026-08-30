@@ -93,13 +93,38 @@ class TursoKVStore {
     await this._run(requests);
   }
 
-  // Wipes the entire stored session. Used when WhatsApp reports the
-  // session as logged out (401) — the stored creds are dead, so we
-  // clear them and start clean rather than getting stuck retrying
-  // with credentials that will never be accepted again.
+  // Wipes the entire table. Kept only for backwards compatibility with
+  // any code that still calls it directly — prefer clearAccountSession()
+  // below, which is scoped to one WhatsApp account so wiping a dead
+  // session never nukes other accounts' creds or the group mapping.
   async clearAll() {
     await this._ensureTable();
     await this._query('DELETE FROM baileys_auth');
+  }
+
+  // Wipes only the stored session for one WhatsApp account. Used when
+  // WhatsApp reports that account's session as logged out — the stored
+  // creds are dead, so we clear just that account's keys and start it
+  // clean, leaving every other account and the group mapping untouched.
+  //
+  // keyPrefix is '' for the original/default account (whose keys are
+  // bare, e.g. "creds", "pre-key-1") and "<accountId>::" for any
+  // additionally-added account.
+  async clearAccountSession(keyPrefix) {
+    await this._ensureTable();
+    if (keyPrefix) {
+      await this._query(
+        "DELETE FROM baileys_auth WHERE key_name LIKE ?",
+        [`${keyPrefix}%`]
+      );
+    } else {
+      // Default account: its keys never contain "::", so scope the
+      // delete to bare keys and explicitly spare the two singleton
+      // keys that aren't part of any account's session.
+      await this._query(
+        "DELETE FROM baileys_auth WHERE key_name NOT LIKE '%::%' AND key_name NOT IN ('group-mapping', 'accounts-registry')"
+      );
+    }
   }
 }
 
