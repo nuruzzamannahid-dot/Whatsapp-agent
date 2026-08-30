@@ -1,12 +1,19 @@
 const { proto, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
-async function useTursoAuthState(store) {
+// keyPrefix namespaces every stored key so multiple WhatsApp accounts can
+// share the same Turso table without colliding. The original single-account
+// deployment used bare keys ("creds", "pre-key-1", ...) — pass '' as the
+// prefix to keep reading/writing those same bare keys so the very first
+// (default) account never needs to re-scan a QR code after this upgrade.
+async function useTursoAuthState(store, keyPrefix = '') {
+  const credsKey = `${keyPrefix}creds`;
+
   let creds;
   try {
-    const credsRaw = await store.get('creds');
+    const credsRaw = await store.get(credsKey);
     creds = credsRaw ? JSON.parse(credsRaw, BufferJSON.reviver) : initAuthCreds();
   } catch (e) {
-    console.error('[baileys-auth] failed to load creds from Turso, starting fresh:', e.message);
+    console.error(`[baileys-auth:${keyPrefix || 'default'}] failed to load creds from Turso, starting fresh:`, e.message);
     creds = initAuthCreds();
   }
 
@@ -18,7 +25,7 @@ async function useTursoAuthState(store) {
           const data = {};
           try {
             await Promise.all(ids.map(async (id) => {
-              let value = await store.get(`${type}-${id}`);
+              let value = await store.get(`${keyPrefix}${type}-${id}`);
               if (value) {
                 value = JSON.parse(value, BufferJSON.reviver);
                 if (type === 'app-state-sync-key' && value) {
@@ -28,7 +35,7 @@ async function useTursoAuthState(store) {
               data[id] = value;
             }));
           } catch (e) {
-            console.error('[baileys-auth] keys.get failed, continuing:', e.message);
+            console.error(`[baileys-auth:${keyPrefix || 'default'}] keys.get failed, continuing:`, e.message);
           }
           return data;
         },
@@ -38,7 +45,7 @@ async function useTursoAuthState(store) {
           for (const category in data) {
             for (const id in data[category]) {
               const value = data[category][id];
-              const key = `${category}-${id}`;
+              const key = `${keyPrefix}${category}-${id}`;
               if (value) {
                 toSave.push({ key, value: JSON.stringify(value, BufferJSON.replacer) });
               } else {
@@ -50,16 +57,16 @@ async function useTursoAuthState(store) {
             if (toSave.length) await store.setMany(toSave);
             if (toDelete.length) await store.deleteMany(toDelete);
           } catch (e) {
-            console.error('[baileys-auth] keys.set failed, continuing:', e.message);
+            console.error(`[baileys-auth:${keyPrefix || 'default'}] keys.set failed, continuing:`, e.message);
           }
         }
       }
     },
     saveCreds: async () => {
       try {
-        await store.set('creds', JSON.stringify(creds, BufferJSON.replacer));
+        await store.set(credsKey, JSON.stringify(creds, BufferJSON.replacer));
       } catch (e) {
-        console.error('[baileys-auth] saveCreds failed, continuing:', e.message);
+        console.error(`[baileys-auth:${keyPrefix || 'default'}] saveCreds failed, continuing:`, e.message);
       }
     }
   };
