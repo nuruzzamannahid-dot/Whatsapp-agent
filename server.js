@@ -82,6 +82,28 @@ async function saveAccountsRegistry(list) {
   await kvStore.set('accounts-registry', JSON.stringify(list));
 }
 
+// ---------- KAM → sending account mapping (Turso) ----------
+// Separate from the group mapping above. The group mapping decides WHICH
+// WhatsApp group a message goes to; this decides WHICH connected WhatsApp
+// account sends it — based on who's logged into the dashboard, not on the
+// target group. So the same "CarryBee Issue Group || NN1" can be messaged
+// by Nahid's number one day and Solayman's the next, whoever is logged in.
+async function loadKamMapping() {
+  try {
+    const raw = await kvStore.get('kam-account-mapping');
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    console.error('[server] failed to load KAM mapping from Turso:', e.message);
+    return {};
+  }
+}
+async function saveKamMapping(mapping) {
+  await kvStore.set('kam-account-mapping', JSON.stringify(mapping));
+}
+function normalizeEmail(email) {
+  return (email || '').trim().toLowerCase();
+}
+
 // ---------- group mapping (Turso) ----------
 // Group mapping used to live in a local groups-config.json file. On
 // Render's free tier, the filesystem is wiped every time the instance
@@ -132,20 +154,30 @@ const kvStore = new TursoKVStore({
 // original message content via getMessage() in the socket config below —
 // without that, the retry just fails and the recipient is stuck showing
 // "Waiting for this message. This may take a while." forever, even though
-// the send itself succeeded. This was the actual cause of the undecrypted
-// OPS messages, not a stale session.
-// Bounded + in-memory is enough here: retries normally happen within
-// seconds to a couple of minutes of sending, never after a process restart.
-const OUTGOING_MSG_STORE_LIMIT = 500;
-const outgoingMessageStore = new Map(); // `${remoteJid}::${id}` -> proto.IMessage
+// the send itself succeeded (the dashboard's toast goes green either way).
+//
+// This used to be an in-memory Map, which is exactly what broke the OPS
+// sends: Render's free tier restarts/spins the process down on inactivity,
+// wiping the Map before a slow retry request could ever look up the
+// original text. It's now backed by Turso (same as the session creds),
+// so a restart between "sent" and "recipient asks for a retry" no longer
+// loses the message.
+const OUTGOING_MSG_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 1 day
+const OUTGOING_MSG_PRUNE_INTERVAL_MS = 60 * 60 * 1000; // hourly
 
-function rememberOutgoingMessage(remoteJid, id, message) {
+async function rememberOutgoingMessage(remoteJid, id, message) {
   if (!id || !message) return;
-  outgoingMessageStore.set(`${remoteJid}::${id}`, message);
-  if (outgoingMessageStore.size > OUTGOING_MSG_STORE_LIMIT) {
-    outgoingMessageStore.delete(outgoingMessageStore.keys().next().value);
+  try {
+    await kvStore.rememberOutgoing(`${remoteJid}::${id}`, message);
+  } catch (e) {
+    console.error('[server] failed to persist outgoing message for retry:', e.message);
   }
 }
+
+setInterval(() => {
+  kvStore.pruneOutgoing(OUTGOING_MSG_MAX_AGE_MS)
+    .catch(e => console.error('[server] failed to prune outgoing message cache:', e.message));
+}, OUTGOING_MSG_PRUNE_INTERVAL_MS);
 
 async function startSock(accountId, label) {
   const prefix = keyPrefixFor(accountId);
@@ -160,10 +192,18 @@ async function startSock(accountId, label) {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    // See outgoingMessageStore above — lets Baileys resend the real content
-    // when a recipient device requests a retry, instead of the message
-    // getting permanently stuck undecrypted on their end.
-    getMessage: async (key) => outgoingMessageStore.get(`${key.remoteJid}::${key.id}`) || undefined
+    // See outgoing message store above — lets Baileys resend the real
+    // content when a recipient device requests a retry, instead of the
+    // message getting permanently stuck undecrypted on their end. Now
+    // reads from Turso so it survives a restart between send and retry.
+    getMessage: async (key) => {
+      try {
+        return (await kvStore.getOutgoing(`${key.remoteJid}::${key.id}`)) || undefined;
+      } catch (e) {
+        console.error('[server] failed to look up outgoing message for retry:', e.message);
+        return undefined;
+      }
+    }
   });
   acc.sock = sock;
 
@@ -457,11 +497,41 @@ app.delete('/api/mapping/:dashboard_name', requireApiKey, async (req, res) => {
   res.json({ ok: true, mapping });
 });
 
+// View current KAM → sending-account mapping
+app.get('/api/kam-mapping', requireApiKey, async (req, res) => {
+  res.json(await loadKamMapping());
+});
+
+// Add or update a KAM mapping entry: { "email": "...", "account_id": "..." }
+// This is what makes each KAM's remarks go out from their own connected
+// WhatsApp number, instead of everyone sharing one account.
+app.post('/api/kam-mapping', requireApiKey, async (req, res) => {
+  const { email, account_id } = req.body;
+  if (!email || !account_id) {
+    return res.status(400).json({ error: 'email and account_id are required' });
+  }
+  if (!accounts[account_id]) {
+    return res.status(400).json({ error: `Unknown account_id "${account_id}". See GET /api/accounts.` });
+  }
+  const mapping = await loadKamMapping();
+  mapping[normalizeEmail(email)] = { email, account_id };
+  await saveKamMapping(mapping);
+  res.json({ ok: true, mapping });
+});
+
+// Remove a KAM mapping entry
+app.delete('/api/kam-mapping/:email', requireApiKey, async (req, res) => {
+  const mapping = await loadKamMapping();
+  delete mapping[normalizeEmail(req.params.email)];
+  await saveKamMapping(mapping);
+  res.json({ ok: true, mapping });
+});
+
 // Main endpoint: dashboard calls this when a KAM saves a remark.
 // Routes to whichever WhatsApp account is mapped to that group.
-// body: { group_name: "CarryBee Issue Group || NN1", message: "...(fully formatted by the dashboard)..." }
+// body: { group_name: "CarryBee Issue Group || NN1", message: "...(fully formatted by the dashboard)...", kam_email: "nuruzzaman.nahid@carrybee.com" }
 app.post('/api/send-remark', requireApiKey, async (req, res) => {
-  const { group_name, message } = req.body;
+  const { group_name, message, kam_email } = req.body;
   if (!group_name || !message) {
     return res.status(400).json({ error: 'group_name and message are required' });
   }
@@ -474,10 +544,26 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
     });
   }
 
-  const accountId = entry.account_id || DEFAULT_ACCOUNT_ID;
+  // Sending account: prefer whoever is logged in on the dashboard (KAM
+  // mapping) over the group's own default account_id. Falls back to the
+  // group's account_id — and then to the default account — for callers
+  // that don't send kam_email (e.g. old cached dashboard code, or the
+  // fixed CTG/OSD/ISD OPS buttons if those senders aren't individually
+  // mapped yet).
+  let accountId = entry.account_id || DEFAULT_ACCOUNT_ID;
+  let accountSource = 'group mapping';
+  if (kam_email) {
+    const kamMapping = await loadKamMapping();
+    const kamEntry = kamMapping[normalizeEmail(kam_email)];
+    if (kamEntry && accounts[kamEntry.account_id]) {
+      accountId = kamEntry.account_id;
+      accountSource = `KAM mapping (${kam_email})`;
+    }
+  }
+
   const acc = accounts[accountId];
   if (!acc) {
-    return res.status(500).json({ error: `Mapping points at unknown account "${accountId}".` });
+    return res.status(500).json({ error: `${accountSource} points at unknown account "${accountId}".` });
   }
   if (!acc.isReady) {
     return res.status(503).json({ error: `WhatsApp account "${acc.label}" is not connected yet` });
@@ -486,7 +572,7 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
   try {
     const sentMsg = await acc.sock.sendMessage(entry.group_id, { text: message });
     if (sentMsg && sentMsg.key && sentMsg.message) {
-      rememberOutgoingMessage(entry.group_id, sentMsg.key.id, sentMsg.message);
+      await rememberOutgoingMessage(entry.group_id, sentMsg.key.id, sentMsg.message);
     }
     res.json({ ok: true, sent_to: entry.label, via_account: acc.label });
   } catch (e) {
@@ -582,6 +668,29 @@ app.get('/admin', (req, res) => {
       <tbody id="mappingsBody"></tbody>
     </table>
 
+    <h2>5. Map a KAM (dashboard login) → sending WhatsApp account</h2>
+    <p style="font-size:11px;color:#888;margin-top:-6px;">This decides whose WhatsApp number a KAM's remarks go out from — independent of which group they're going to. Without an entry here, that KAM's sends fall back to the group's default account.</p>
+    <div class="row">
+      <div>
+        <label>KAM's dashboard login email</label>
+        <input type="text" id="kamEmail" placeholder="nuruzzaman.nahid@carrybee.com" />
+      </div>
+    </div>
+    <label>Sends via WhatsApp account</label>
+    <select id="kamAccountSelect" style="width:100%;">
+      <option value="">Load accounts above first</option>
+    </select>
+    <button onclick="saveKamMapping()">Save KAM mapping</button>
+    <div id="kamMapMsg"></div>
+
+    <h2>6. Current KAM mappings</h2>
+    <button class="secondary" onclick="loadKamMappings()">Refresh KAM mappings</button>
+    <div id="kamMappingsMsg"></div>
+    <table id="kamMappingsTable" style="display:none;">
+      <thead><tr><th>KAM email</th><th>Sends via</th><th></th></tr></thead>
+      <tbody id="kamMappingsBody"></tbody>
+    </table>
+
     <script>
       function key() { return document.getElementById('apiKey').value.trim(); }
       function showMsg(elId, text, ok) {
@@ -616,6 +725,8 @@ app.get('/admin', (req, res) => {
           document.getElementById('accountsTable').style.display = lastAccounts.length ? 'table' : 'none';
           const select = document.getElementById('groupsAccountSelect');
           select.innerHTML = lastAccounts.map(a => '<option value="' + a.id + '">' + a.label + (a.ready ? '' : ' (not connected)') + '</option>').join('');
+          const kamSelect = document.getElementById('kamAccountSelect');
+          kamSelect.innerHTML = lastAccounts.map(a => '<option value="' + a.id + '">' + a.label + (a.ready ? '' : ' (not connected)') + '</option>').join('');
           showMsg('accountsMsg', 'Loaded ' + lastAccounts.length + ' account(s).', true);
         } catch (e) {
           showMsg('accountsMsg', e.message, false);
@@ -706,6 +817,49 @@ app.get('/admin', (req, res) => {
           loadMappings();
         } catch (e) {
           showMsg('mappingsMsg', e.message, false);
+        }
+      }
+
+      async function saveKamMapping() {
+        if (!key()) { showMsg('kamMapMsg', 'Enter your API key first.', false); return; }
+        const email = document.getElementById('kamEmail').value.trim();
+        const account_id = document.getElementById('kamAccountSelect').value;
+        if (!email || !account_id) { showMsg('kamMapMsg', 'Fill in the email and pick an account.', false); return; }
+        try {
+          await api('/api/kam-mapping', { method: 'POST', body: JSON.stringify({ email, account_id }) });
+          showMsg('kamMapMsg', 'Saved: "' + email + '" sends via that account.', true);
+          document.getElementById('kamEmail').value = '';
+          loadKamMappings();
+        } catch (e) {
+          showMsg('kamMapMsg', e.message, false);
+        }
+      }
+
+      async function loadKamMappings() {
+        if (!key()) { showMsg('kamMappingsMsg', 'Enter your API key first.', false); return; }
+        try {
+          const data = await api('/api/kam-mapping');
+          const entries = Object.entries(data);
+          const body = document.getElementById('kamMappingsBody');
+          body.innerHTML = entries.map(([emailKey, v]) => {
+            const acc = lastAccounts.find(a => a.id === v.account_id);
+            return '<tr><td>' + v.email + '</td><td>' + (acc ? acc.label : v.account_id) + '</td>' +
+              '<td><button class="secondary" onclick="removeKamMapping(\\'' + v.email.replace(/'/g, "\\\\'") + '\\')">Remove</button></td></tr>';
+          }).join('');
+          document.getElementById('kamMappingsTable').style.display = entries.length ? 'table' : 'none';
+          showMsg('kamMappingsMsg', entries.length + ' KAM mapping(s) saved.', true);
+        } catch (e) {
+          showMsg('kamMappingsMsg', e.message, false);
+        }
+      }
+
+      async function removeKamMapping(email) {
+        if (!key()) return;
+        try {
+          await api('/api/kam-mapping/' + encodeURIComponent(email), { method: 'DELETE' });
+          loadKamMappings();
+        } catch (e) {
+          showMsg('kamMappingsMsg', e.message, false);
         }
       }
     </script>
