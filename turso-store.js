@@ -102,6 +102,32 @@ class TursoKVStore {
     await this._query('DELETE FROM baileys_auth');
   }
 
+  // ---------- outgoing message cache (for Baileys retry receipts) ----------
+  // Stored as regular rows in the same table, under an "outgoing::" key
+  // prefix, so it survives a Render restart/spin-down the same way the
+  // session creds already do — that's the whole point of this fix.
+  async rememberOutgoing(msgKey, message) {
+    await this.set(`outgoing::${msgKey}`, JSON.stringify(message));
+  }
+
+  async getOutgoing(msgKey) {
+    const raw = await this.get(`outgoing::${msgKey}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }
+
+  // Retry receipts only ever arrive within minutes of the original send,
+  // so anything older than a day is just dead weight. Called on a timer,
+  // not on every send, to keep the hot path (sendMessage) to one write.
+  async pruneOutgoing(maxAgeMs) {
+    await this._ensureTable();
+    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+    await this._query(
+      "DELETE FROM baileys_auth WHERE key_name LIKE 'outgoing::%' AND updated_at < ?",
+      [cutoff]
+    );
+  }
+
   // Wipes only the stored session for one WhatsApp account. Used when
   // WhatsApp reports that account's session as logged out — the stored
   // creds are dead, so we clear just that account's keys and start it
