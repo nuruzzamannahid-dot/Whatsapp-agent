@@ -27,6 +27,21 @@ const API_KEY = process.env.API_KEY || 'changeme';
 const MAPPING_FILE = path.join(__dirname, 'groups-config.json');
 const DEFAULT_ACCOUNT_ID = 'default';
 
+// ---------- named admins ----------
+// ADMIN_KEYS lets more than one person use /admin, each with their own key,
+// instead of everyone sharing the single API_KEY. Format (comma-separated):
+//   ADMIN_KEYS=Nahid:long-random-string,Asif:another-long-random-string
+// The original API_KEY still works too (as an unnamed admin), so nothing
+// breaks for anyone still using the shared key.
+const ADMIN_KEYS = new Map(); // key string -> label
+(process.env.ADMIN_KEYS || '').split(',').forEach((entry) => {
+  const idx = entry.indexOf(':');
+  if (idx === -1) return;
+  const label = entry.slice(0, idx).trim();
+  const key = entry.slice(idx + 1).trim();
+  if (label && key) ADMIN_KEYS.set(key, label);
+});
+
 // ---------- per-account state ----------
 // accounts[id] = { id, label, sock, isReady, userInfo, latestQr }
 // The very first account is always "default" and always uses bare Turso
@@ -266,10 +281,15 @@ app.use(express.json());
 
 function requireApiKey(req, res, next) {
   const key = req.header('x-api-key');
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Invalid or missing x-api-key header' });
+  if (key === API_KEY) {
+    req.adminName = 'default';
+    return next();
   }
-  next();
+  if (key && ADMIN_KEYS.has(key)) {
+    req.adminName = ADMIN_KEYS.get(key);
+    return next();
+  }
+  return res.status(401).json({ error: 'Invalid or missing x-api-key header' });
 }
 
 function requireAccount(req, res, next) {
@@ -427,6 +447,7 @@ app.post('/api/accounts', requireApiKey, async (req, res) => {
   list.push({ id, label: label.trim() });
   await saveAccountsRegistry(list);
   accounts[id] = { id, label: label.trim(), isReady: false, userInfo: null, latestQr: null };
+  console.log(`[admin:${req.adminName}] added account "${label.trim()}" (${id})`);
   await startSock(id, label.trim());
   res.json({ ok: true, account: publicAccountInfo(accounts[id]), qr_url: `/qr/${id}`, pair_url: `/pair/${id}` });
 });
@@ -440,6 +461,7 @@ app.delete('/api/accounts/:accountId', requireApiKey, requireAccount, async (req
   if (acc.id === DEFAULT_ACCOUNT_ID) {
     return res.status(400).json({ error: 'The default account cannot be removed.' });
   }
+  console.log(`[admin:${req.adminName}] removing account "${acc.label}" (${acc.id})`);
   try {
     if (acc.sock) {
       try { await acc.sock.logout(); } catch (e) { /* best-effort */ }
