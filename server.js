@@ -165,10 +165,10 @@ const kvStore = new TursoKVStore({
 const OUTGOING_MSG_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 1 day
 const OUTGOING_MSG_PRUNE_INTERVAL_MS = 60 * 60 * 1000; // hourly
 
-async function rememberOutgoingMessage(remoteJid, id, message) {
+async function rememberOutgoingMessage(accountId, remoteJid, id, message) {
   if (!id || !message) return;
   try {
-    await kvStore.rememberOutgoing(`${remoteJid}::${id}`, message);
+    await kvStore.rememberOutgoing(`${accountId}::${remoteJid}::${id}`, message);
   } catch (e) {
     console.error('[server] failed to persist outgoing message for retry:', e.message);
   }
@@ -198,7 +198,7 @@ async function startSock(accountId, label) {
     // reads from Turso so it survives a restart between send and retry.
     getMessage: async (key) => {
       try {
-        return (await kvStore.getOutgoing(`${key.remoteJid}::${key.id}`)) || undefined;
+        return (await kvStore.getOutgoing(`${accountId}::${key.remoteJid}::${key.id}`)) || undefined;
       } catch (e) {
         console.error('[server] failed to look up outgoing message for retry:', e.message);
         return undefined;
@@ -572,7 +572,7 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
   try {
     const sentMsg = await acc.sock.sendMessage(entry.group_id, { text: message });
     if (sentMsg && sentMsg.key && sentMsg.message) {
-      await rememberOutgoingMessage(entry.group_id, sentMsg.key.id, sentMsg.message);
+      await rememberOutgoingMessage(accountId, entry.group_id, sentMsg.key.id, sentMsg.message);
     }
     res.json({ ok: true, sent_to: entry.label, via_account: acc.label });
   } catch (e) {
